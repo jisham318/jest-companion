@@ -233,7 +233,19 @@ function loop()
 end
 
 if not RunService:IsRunning() then
-	while true do
+	local running = true
+
+	-- A reinstall or hot-reload (e.g. drillbit overwriting the .rbxm while Studio is open) starts a
+	-- fresh copy of this script but doesn't reliably stop the old one's loop. Stop ours when the
+	-- plugin unloads so we don't leave stale loops polling the server every 0.5s forever.
+	local pluginRef: Plugin? = plugin
+	if pluginRef then
+		pluginRef.Unloading:Connect(function()
+			running = false
+		end)
+	end
+
+	while running do
 		loop()
 		task.wait(0.5)
 	end

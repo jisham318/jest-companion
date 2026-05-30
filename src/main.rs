@@ -51,6 +51,10 @@ struct CliCoord {
     spinner: Mutex<ProgressBar>,
     plugin_connected: Mutex<bool>,
     received_first_write: Mutex<bool>,
+    /// We warn once when an extra plugin polls after one has already connected, then stay quiet —
+    /// otherwise every duplicate poll (a second Studio window, or a stale plugin loop left behind
+    /// by a hot-reload) floods the log every 0.5s for the whole run.
+    duplicate_poll_warned: Mutex<bool>,
 }
 
 #[tokio::main]
@@ -91,6 +95,7 @@ async fn run_cli(args: Cli) -> anyhow::Result<()> {
         spinner: Mutex::new(spinner),
         plugin_connected: Mutex::new(false),
         received_first_write: Mutex::new(false),
+        duplicate_poll_warned: Mutex::new(false),
     });
 
     let state = AppState {
@@ -247,8 +252,28 @@ async fn poll(
         Coordinator::Cli(coord) => {
             let mut plugin_connected = coord.plugin_connected.lock().await;
             if *plugin_connected {
-                warn!("A plugin tried to connect while we are already listening to one.");
-                return (StatusCode::BAD_REQUEST, "Already connected").into_response();
+                // Another plugin is polling while one already owns this one-shot run — a second
+                // Studio window, or a stale loop left behind by a plugin hot-reload. Tell it to
+                // stay idle (run: false) instead of rejecting with a 400, which the plugin treats
+                // as an error and retries loudly. Warn once so the situation is still discoverable.
+                let mut warned = coord.duplicate_poll_warned.lock().await;
+                if !*warned {
+                    *warned = true;
+                    warn!(
+                        "Another plugin polled while one is already running the tests (e.g. a \
+                         second Studio window, or a stale plugin from a hot-reload). Ignoring it \
+                         for the rest of this run."
+                    );
+                }
+                return (
+                    StatusCode::OK,
+                    Json(PollResponseBody {
+                        projects: Vec::new(),
+                        options: Value::Object(Default::default()),
+                        run: false,
+                    }),
+                )
+                    .into_response();
             }
             *plugin_connected = true;
 
@@ -458,5 +483,75 @@ async fn fs_delete(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         None => (StatusCode::NOT_FOUND, "Could not resolve path").into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt; // for `oneshot`
+
+    fn cli_app() -> Router {
+        let coord = Arc::new(CliCoord {
+            spinner: Mutex::new(ProgressBar::hidden()),
+            plugin_connected: Mutex::new(false),
+            received_first_write: Mutex::new(false),
+            duplicate_poll_warned: Mutex::new(false),
+        });
+        let state = AppState {
+            args: Arc::new(Cli::parse_from(["jest-companion", "/tmp"])),
+            config: Arc::new(Config::default()),
+            coord: Coordinator::Cli(coord),
+        };
+        router(state)
+    }
+
+    async fn post_poll(app: &Router, protocol_version: &str) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/poll")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"protocolVersion":"{protocol_version}","rojoConnected":true}}"#
+            )))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, body)
+    }
+
+    // The bug fix: in one-shot CLI mode the first poll runs the tests, but every later poll (a
+    // second Studio window, or a stale plugin loop after a hot-reload) used to get a 400 that the
+    // plugin retried loudly, flooding the log. Now duplicates get a quiet 200 {run:false}.
+    #[tokio::test]
+    async fn cli_first_poll_runs_then_duplicates_idle() {
+        let app = cli_app();
+
+        let (status, body) = post_poll(&app, PROTOCOL_VERSION).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["run"], Value::Bool(true));
+
+        for _ in 0..3 {
+            let (status, body) = post_poll(&app, PROTOCOL_VERSION).await;
+            assert_eq!(status, StatusCode::OK, "duplicate polls must not 400");
+            assert_eq!(
+                body["run"],
+                Value::Bool(false),
+                "duplicate polls must be told to stay idle"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_rejects_wrong_protocol_version() {
+        let app = cli_app();
+        let (status, _) = post_poll(&app, "999").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 }
