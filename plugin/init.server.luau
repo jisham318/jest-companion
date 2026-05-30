@@ -102,13 +102,20 @@ function runTests(body: TestBody): TestResults
 	}
 end
 
-local URL = "http://127.0.0.1:28860"
+-- The CLI and the long-running MCP server listen on different ports so both can run at the same
+-- time. We poll each of them and serve whichever one has a run pending.
+local CLI_URL = "http://127.0.0.1:28860"
+local MCP_URL = "http://127.0.0.1:28861"
+local SERVER_URLS = { CLI_URL, MCP_URL }
+-- Stashed on Workspace so the patched FileSystemService/Writeable modules (which get cloned into
+-- the Jest tree, away from this script) know which server to report a run's output back to.
+local SERVER_URL_ATTRIBUTE = "__JestCompanion_ServerUrl"
 local PROTOCOL_VERSION = "3"
 
-function poll(): TestBody?
+function poll(url: string): TestBody?
 	local reqSuccess, response = pcall(function()
 		return HttpService:RequestAsync({
-			Url = `{URL}/poll`,
+			Url = `{url}/poll`,
 			Method = "POST",
 			Body = HttpService:JSONEncode({
 				protocolVersion = PROTOCOL_VERSION,
@@ -135,10 +142,10 @@ function poll(): TestBody?
 	return HttpService:JSONDecode(response.Body) :: TestBody
 end
 
-function sendResults(results: TestResults)
+function sendResults(url: string, results: TestResults)
 	local reqSuccess, response = pcall(function()
 		return HttpService:RequestAsync({
-			Url = `{URL}/results`,
+			Url = `{url}/results`,
 			Method = "POST",
 			Body = HttpService:JSONEncode(results),
 			Headers = { ["Content-Type"] = "application/json" },
@@ -155,10 +162,10 @@ function sendResults(results: TestResults)
 	end
 end
 
-function reportError()
+function reportError(url: string)
 	local reqSuccess = pcall(function()
 		return HttpService:RequestAsync({
-			Url = `{URL}/run-error`,
+			Url = `{url}/run-error`,
 			Method = "POST",
 			Compress = Enum.HttpCompression.None,
 		})
@@ -171,27 +178,9 @@ function reportError()
 	return nil
 end
 
-function loop()
-	local body: TestBody
-	do
-		local success, bodyOrErr = pcall(poll)
-		if not success then
-			warn(`Failed to poll server: {bodyOrErr}`)
-			return
-		end
-
-		if not bodyOrErr then
-			return
-		end
-
-		body = bodyOrErr
-	end
-
-	-- The server (currently only in MCP mode) can tell us to stay idle when there's no run
-	-- pending, so we don't run the whole suite on every poll.
-	if body.run == false then
-		return
-	end
+function runForServer(url: string, body: TestBody)
+	-- Tell the patched filesystem/write modules which server to report this run's output back to.
+	Workspace:SetAttribute(SERVER_URL_ATTRIBUTE, url)
 
 	local output: TestResults
 	do
@@ -199,7 +188,7 @@ function loop()
 		if not success then
 			warn(`Test run error: {outputOrErr}`)
 
-			local reportSuccess, reportErr = pcall(reportError)
+			local reportSuccess, reportErr = pcall(reportError, url)
 			if not reportSuccess then
 				warn(`Failed to report error: {reportErr}`)
 			end
@@ -210,9 +199,36 @@ function loop()
 		output = outputOrErr
 	end
 
-	local success, err = pcall(sendResults, output)
+	local success, err = pcall(sendResults, url, output)
 	if not success then
 		warn(`Failed to send output: {err}`)
+	end
+end
+
+function loop()
+	-- Poll each server in turn and serve the first one that has a run pending. The CLI is one-shot
+	-- and time-sensitive, so it goes first; the MCP server stays idle (run == false) between runs.
+	for _, url in SERVER_URLS do
+		local success, bodyOrErr = pcall(poll, url)
+		if not success then
+			warn(`Failed to poll server at {url}: {bodyOrErr}`)
+			continue
+		end
+
+		local body = bodyOrErr :: TestBody?
+		if body == nil then
+			-- That server isn't running; try the next one.
+			continue
+		end
+
+		-- The server (currently only in MCP mode) can tell us to stay idle when there's no run
+		-- pending, so we don't run the whole suite on every poll.
+		if body.run == false then
+			continue
+		end
+
+		runForServer(url, body)
+		return
 	end
 end
 

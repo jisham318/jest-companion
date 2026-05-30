@@ -22,6 +22,11 @@ mod config;
 mod mcp;
 mod resolver;
 
+/// The one-shot CLI owns this port. The long-running MCP server uses a separate one so the two can
+/// run at the same time; the Studio plugin polls both and serves whichever has a run pending.
+const CLI_PORT: u16 = 28860;
+const MCP_PORT: u16 = 28861;
+
 #[derive(Clone)]
 struct AppState {
     args: Arc<Cli>,
@@ -94,7 +99,7 @@ async fn run_cli(args: Cli) -> anyhow::Result<()> {
         coord: Coordinator::Cli(coord),
     };
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:28860").await?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", CLI_PORT)).await?;
 
     {
         let state = state.clone();
@@ -156,7 +161,7 @@ async fn run_mcp(args: Cli) -> anyhow::Result<()> {
         coord: Coordinator::Mcp(coord.clone()),
     };
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:28860").await?;
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", MCP_PORT)).await?;
     let server = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, router(state)).await {
             error!("HTTP server error: {e}");
