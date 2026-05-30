@@ -25,12 +25,17 @@ use tokio::{
 /// `/results` (or `/run-error`) handler signals completion through `done`.
 pub struct McpCoord {
     pub active: Mutex<Option<ActiveRun>>,
+    /// Whether this process managed to bind the HTTP port the Studio plugin reports to. If it
+    /// didn't (another jest-companion MCP server already owns the port), we still serve the stdio
+    /// connection to the client, but `run_tests` can't actually drive a run, so it reports that.
+    pub http_available: bool,
 }
 
 impl McpCoord {
-    pub fn new() -> Self {
+    pub fn new(http_available: bool) -> Self {
         Self {
             active: Mutex::new(None),
+            http_available,
         }
     }
 }
@@ -361,6 +366,14 @@ async fn run_tests(
     cli: &Arc<Cli>,
     config: &Arc<Config>,
 ) -> anyhow::Result<(String, bool)> {
+    if !coord.http_available {
+        anyhow::bail!(
+            "This jest-companion MCP server could not bind its port, so it can't reach the Studio \
+             plugin. Another jest-companion MCP server is most likely already running — use that \
+             one, or stop it and restart this server."
+        );
+    }
+
     let all_projects: Vec<String> = config.projects.keys().cloned().collect();
     if all_projects.is_empty() {
         anyhow::bail!(

@@ -153,25 +153,40 @@ async fn run_mcp(args: Cli) -> anyhow::Result<()> {
 
     let args = Arc::new(args);
     let config = Arc::new(config);
-    let coord = Arc::new(McpCoord::new());
 
-    let state = AppState {
-        args: args.clone(),
-        config: config.clone(),
-        coord: Coordinator::Mcp(coord.clone()),
+    // The HTTP server (which the Studio plugin reports to) is best-effort. If the port is already
+    // taken — almost always another jest-companion MCP server that's still running — binding it
+    // must NOT be fatal, or this process would exit before completing the stdio handshake and the
+    // client would just see "failed to connect". Serve the stdio connection regardless; run_tests
+    // reports clearly when this instance doesn't own the port.
+    let http_available = match tokio::net::TcpListener::bind(("127.0.0.1", MCP_PORT)).await {
+        Ok(listener) => {
+            let coord = Arc::new(McpCoord::new(true));
+            let state = AppState {
+                args: args.clone(),
+                config: config.clone(),
+                coord: Coordinator::Mcp(coord.clone()),
+            };
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, router(state)).await {
+                    error!("HTTP server error: {e}");
+                }
+            });
+            return mcp::serve(coord, args, config).await;
+        }
+        Err(e) => {
+            warn!(
+                "Could not bind 127.0.0.1:{MCP_PORT} ({e}). Another jest-companion MCP server is \
+                 probably already running; this instance will connect but run_tests will be \
+                 unavailable."
+            );
+            false
+        }
     };
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", MCP_PORT)).await?;
-    let server = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, router(state)).await {
-            error!("HTTP server error: {e}");
-        }
-    });
-
-    // Runs until the client closes stdin.
-    let result = mcp::serve(coord, args, config).await;
-    server.abort();
-    result
+    let coord = Arc::new(McpCoord::new(http_available));
+    // Still serve stdio so the client connects cleanly (run_tests will explain it can't run).
+    mcp::serve(coord, args, config).await
 }
 
 fn router(state: AppState) -> Router {
