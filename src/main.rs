@@ -1,8 +1,4 @@
-use crate::{
-    cli::{Cli, JestOptions},
-    config::Config,
-    resolver::resolve_path,
-};
+use crate::{cli::Cli, config::Config, mcp::McpCoord, resolver::resolve_path};
 use anyhow::Context;
 use axum::{
     Json, Router,
@@ -17,24 +13,55 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::{debug, error, warn};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 mod cli;
 mod config;
+mod mcp;
 mod resolver;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct AppState {
     args: Arc<Cli>,
     config: Arc<Config>,
-    spinner: Arc<Mutex<ProgressBar>>,
-    plugin_connected: Arc<Mutex<bool>>,
-    received_first_write: bool,
+    coord: Coordinator,
+}
+
+/// Whatever drives a test run differs between the two modes, so the HTTP handlers delegate the
+/// mode-specific bits (where do options come from, where does output go, what happens when a run
+/// finishes) to one of these.
+#[derive(Clone)]
+enum Coordinator {
+    /// One-shot CLI: there is exactly one run, output goes to the spinner, and the process exits
+    /// when results come back.
+    Cli(Arc<CliCoord>),
+    /// Long-running MCP server: many runs over the process lifetime, each driven by a `run_tests`
+    /// tool call.
+    Mcp(Arc<McpCoord>),
+}
+
+struct CliCoord {
+    spinner: Mutex<ProgressBar>,
+    plugin_connected: Mutex<bool>,
+    received_first_write: Mutex<bool>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args = Cli::parse();
+
+    if args.mcp {
+        run_mcp(args).await
+    } else {
+        run_cli(args).await
+    }
+}
+
+/// The original one-shot behaviour: spin up the server, wait for the Studio plugin to run the
+/// tests once, print the output, and exit with the test result.
+async fn run_cli(args: Cli) -> anyhow::Result<()> {
     let logger =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .format_timestamp(None)
@@ -47,8 +74,6 @@ async fn main() -> anyhow::Result<()> {
     LogWrapper::new(multi.clone(), logger).try_init().unwrap();
     log::set_max_level(level);
 
-    let args = Cli::parse();
-
     let config = fs::read_to_string(args.path.join("jest-companion.toml")).await?;
     let config: Config = toml::from_str(&config).context("Failed to parse config file")?;
 
@@ -57,25 +82,17 @@ async fn main() -> anyhow::Result<()> {
     spinner.set_message("Waiting for plugin");
     spinner.enable_steady_tick(Duration::from_millis(100));
 
+    let coord = Arc::new(CliCoord {
+        spinner: Mutex::new(spinner),
+        plugin_connected: Mutex::new(false),
+        received_first_write: Mutex::new(false),
+    });
+
     let state = AppState {
         args: Arc::new(args),
         config: Arc::new(config),
-        spinner: Arc::new(Mutex::new(spinner)),
-        plugin_connected: Arc::new(Mutex::new(false)),
-        received_first_write: false,
+        coord: Coordinator::Cli(coord),
     };
-
-    let app = Router::new()
-        .route("/poll", post(poll))
-        .route("/write", post(write))
-        .route("/results", post(results))
-        .route("/run-error", post(run_error))
-        .route("/fs/file/{*path}", put(fs_write))
-        .route("/fs/dir/{*path}", put(fs_create_dir_all))
-        .route("/fs/exists/{*path}", get(fs_exists))
-        .route("/fs/file/{*path}", delete(fs_delete))
-        .with_state(state.clone())
-        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:28860").await?;
 
@@ -84,20 +101,89 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(state.args.server_timeout)).await;
 
-            let spinner = state.spinner.lock().await;
-            spinner.finish_and_clear();
+            if let Coordinator::Cli(coord) = &state.coord {
+                let spinner = coord.spinner.lock().await;
+                spinner.finish_and_clear();
+            }
 
             error!("No places have reported anything. Studio might not be open?");
             std::process::exit(1);
         })
     };
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, router(state)).await?;
 
     Ok(())
 }
 
-const PROTOCOL_VERSION: &str = "2";
+/// Run as an MCP server: keep the HTTP server alive for the whole session and let `run_tests` tool
+/// calls drive individual runs through the [`McpCoord`].
+async fn run_mcp(args: Cli) -> anyhow::Result<()> {
+    // The MCP protocol owns stdout, so logs must go to stderr and we skip the spinner entirely.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp(None)
+        .format_module_path(false)
+        .target(env_logger::Target::Stderr)
+        .init();
+
+    // Unlike the CLI, a missing/invalid config shouldn't take down the server (which would just
+    // make the client's connection fail). Start anyway; run_tests reports the problem clearly.
+    let config = match fs::read_to_string(args.path.join("jest-companion.toml")).await {
+        Ok(contents) => match toml::from_str::<Config>(&contents) {
+            Ok(config) => config,
+            Err(e) => {
+                error!("Failed to parse jest-companion.toml: {e}");
+                Config::default()
+            }
+        },
+        Err(e) => {
+            warn!(
+                "Could not read jest-companion.toml ({e}); run_tests will fail until it exists. \
+                 Looked in {}",
+                args.path.display()
+            );
+            Config::default()
+        }
+    };
+
+    let args = Arc::new(args);
+    let config = Arc::new(config);
+    let coord = Arc::new(McpCoord::new());
+
+    let state = AppState {
+        args: args.clone(),
+        config: config.clone(),
+        coord: Coordinator::Mcp(coord.clone()),
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:28860").await?;
+    let server = tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, router(state)).await {
+            error!("HTTP server error: {e}");
+        }
+    });
+
+    // Runs until the client closes stdin.
+    let result = mcp::serve(coord, args, config).await;
+    server.abort();
+    result
+}
+
+fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/poll", post(poll))
+        .route("/write", post(write))
+        .route("/results", post(results))
+        .route("/run-error", post(run_error))
+        .route("/fs/file/{*path}", put(fs_write))
+        .route("/fs/dir/{*path}", put(fs_create_dir_all))
+        .route("/fs/exists/{*path}", get(fs_exists))
+        .route("/fs/file/{*path}", delete(fs_delete))
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
+}
+
+const PROTOCOL_VERSION: &str = "3";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,19 +196,17 @@ struct PollRequestBody {
 #[serde(rename_all = "camelCase")]
 struct PollResponseBody {
     projects: Vec<String>,
-    options: JestOptions,
+    options: Value,
+    /// Whether the plugin should actually run the tests now. In CLI mode this is always true; in
+    /// MCP mode it's only true when a `run_tests` call is waiting, so the plugin can poll quietly
+    /// the rest of the time.
+    run: bool,
 }
 
 async fn poll(
     State(state): State<AppState>,
     Json(body): Json<PollRequestBody>,
 ) -> impl IntoResponse {
-    let mut plugin_connected = state.plugin_connected.lock().await;
-    if *plugin_connected {
-        warn!("A plugin tried to connect while we are already listening to one.");
-        return (StatusCode::BAD_REQUEST, "Already connected").into_response();
-    }
-
     if body.protocol_version != PROTOCOL_VERSION {
         warn!(
             "The plugin tried to connect with protocol version {} but we are expecting {PROTOCOL_VERSION}. Make sure your versions align.",
@@ -139,33 +223,88 @@ async fn poll(
             .into_response();
     }
 
-    *plugin_connected = true;
+    match &state.coord {
+        Coordinator::Cli(coord) => {
+            let mut plugin_connected = coord.plugin_connected.lock().await;
+            if *plugin_connected {
+                warn!("A plugin tried to connect while we are already listening to one.");
+                return (StatusCode::BAD_REQUEST, "Already connected").into_response();
+            }
+            *plugin_connected = true;
 
-    if !body.rojo_connected {
-        warn!("Rojo is not connected on the running Studio instance");
+            if !body.rojo_connected {
+                warn!("Rojo is not connected on the running Studio instance");
+            }
+
+            let spinner = coord.spinner.lock().await;
+            spinner.set_message("Waiting for test results");
+
+            let projects: Vec<String> = state.config.projects.keys().cloned().collect();
+            let options = serde_json::to_value(&state.args.options).unwrap_or(Value::Null);
+
+            (
+                StatusCode::OK,
+                Json(PollResponseBody {
+                    projects,
+                    options,
+                    run: true,
+                }),
+            )
+                .into_response()
+        }
+        Coordinator::Mcp(coord) => {
+            let mut active = coord.active.lock().await;
+            match active.as_mut() {
+                Some(run) if !run.dispatched => {
+                    run.dispatched = true;
+
+                    if !body.rojo_connected {
+                        debug!("Rojo is not connected on the running Studio instance");
+                    }
+
+                    (
+                        StatusCode::OK,
+                        Json(PollResponseBody {
+                            projects: run.projects.clone(),
+                            options: run.options.clone(),
+                            run: true,
+                        }),
+                    )
+                        .into_response()
+                }
+                // No run pending (or one is already running): tell the plugin to stay idle.
+                _ => (
+                    StatusCode::OK,
+                    Json(PollResponseBody {
+                        projects: Vec::new(),
+                        options: Value::Object(Default::default()),
+                        run: false,
+                    }),
+                )
+                    .into_response(),
+            }
+        }
     }
-
-    let spinner = state.spinner.lock().await;
-    spinner.set_message("Waiting for test results");
-
-    let projects: Vec<String> = state.config.projects.keys().cloned().collect();
-
-    let body = PollResponseBody {
-        projects,
-        options: state.args.options.clone(),
-    };
-
-    (StatusCode::OK, Json(body)).into_response()
 }
 
-async fn write(State(mut state): State<AppState>, data: String) -> impl IntoResponse {
-    let spinner = state.spinner.lock().await;
-    if !state.received_first_write {
-        state.received_first_write = true;
-        spinner.set_message("Receiving results");
+async fn write(State(state): State<AppState>, data: String) -> impl IntoResponse {
+    match &state.coord {
+        Coordinator::Cli(coord) => {
+            let spinner = coord.spinner.lock().await;
+            let mut received_first_write = coord.received_first_write.lock().await;
+            if !*received_first_write {
+                *received_first_write = true;
+                spinner.set_message("Receiving results");
+            }
+            spinner.println(&data);
+        }
+        Coordinator::Mcp(coord) => {
+            let mut active = coord.active.lock().await;
+            if let Some(run) = active.as_mut() {
+                run.output.push_str(&data);
+            }
+        }
     }
-
-    spinner.println(&data);
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,27 +313,61 @@ struct Results {
 }
 
 async fn results(State(state): State<AppState>, Json(results): Json<Results>) -> impl IntoResponse {
-    let spinner = state.spinner.lock().await;
-    spinner.finish_and_clear();
+    match &state.coord {
+        Coordinator::Cli(coord) => {
+            let spinner = coord.spinner.lock().await;
+            spinner.finish_and_clear();
 
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        std::process::exit(if results.success { 0 } else { 1 });
-    });
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                std::process::exit(if results.success { 0 } else { 1 });
+            });
+        }
+        Coordinator::Mcp(coord) => {
+            let coord = coord.clone();
+            tokio::spawn(async move {
+                // The plugin sends writes fire-and-forget, so wait a beat for trailing output
+                // before we declare the run done (mirrors the CLI's pre-exit grace period).
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let mut active = coord.active.lock().await;
+                if let Some(run) = active.as_mut()
+                    && let Some(tx) = run.done.take()
+                {
+                    let _ = tx.send(mcp::Outcome::Finished(results.success));
+                }
+            });
+        }
+    }
 
     (StatusCode::OK, ())
 }
 
 async fn run_error(State(state): State<AppState>) -> impl IntoResponse {
-    let spinner = state.spinner.lock().await;
-    spinner.finish_and_clear();
+    match &state.coord {
+        Coordinator::Cli(coord) => {
+            let spinner = coord.spinner.lock().await;
+            spinner.finish_and_clear();
 
-    error!("The test runner encountered an error. See the Studio output for more details.");
+            error!("The test runner encountered an error. See the Studio output for more details.");
 
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        std::process::exit(1);
-    });
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                std::process::exit(1);
+            });
+        }
+        Coordinator::Mcp(coord) => {
+            let coord = coord.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let mut active = coord.active.lock().await;
+                if let Some(run) = active.as_mut()
+                    && let Some(tx) = run.done.take()
+                {
+                    let _ = tx.send(mcp::Outcome::RunError);
+                }
+            });
+        }
+    }
 
     (StatusCode::OK, ())
 }

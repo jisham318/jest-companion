@@ -72,6 +72,9 @@ type TestBody = {
 	options: {
 		[string]: unknown?,
 	},
+	-- When false, the server has nothing for us to run right now (used by the MCP server, which
+	-- keeps the server alive between runs). Absent or true means run as normal.
+	run: boolean?,
 }
 
 type TestResults = {
@@ -100,7 +103,7 @@ function runTests(body: TestBody): TestResults
 end
 
 local URL = "http://127.0.0.1:28860"
-local PROTOCOL_VERSION = "2"
+local PROTOCOL_VERSION = "3"
 
 function poll(): TestBody?
 	local reqSuccess, response = pcall(function()
@@ -182,6 +185,12 @@ function loop()
 		end
 
 		body = bodyOrErr
+	end
+
+	-- The server (currently only in MCP mode) can tell us to stay idle when there's no run
+	-- pending, so we don't run the whole suite on every poll.
+	if body.run == false then
+		return
 	end
 
 	local output: TestResults

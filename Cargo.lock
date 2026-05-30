@@ -517,6 +517,7 @@ dependencies = [
  "indicatif-log-bridge",
  "log",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
 ]
@@ -851,6 +852,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "89e49afdadebb872d3145a5638b59eb0691ea23e46ca484037cfab3b76b95038"
 dependencies = [
  "backtrace",
+ "bytes",
  "io-uring",
  "libc",
  "mio",

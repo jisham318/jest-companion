@@ -11,9 +11,23 @@ pub struct Cli {
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
-    /// Timeout for the server to receive results in seconds.
+    /// Run as a Model Context Protocol (MCP) server over stdio instead of doing a
+    /// one-shot test run. Lets MCP clients (like Claude) trigger runs via a `run_tests`
+    /// tool. In this mode the runCLI options below act as defaults that each tool call
+    /// can override.
+    #[arg(long)]
+    pub mcp: bool,
+
+    /// Timeout in seconds for the Studio plugin to report something.
+    /// In MCP mode, this is how long a `run_tests` call waits for the plugin to pick up
+    /// the run before reporting that Studio isn't open.
     #[arg(short, long, default_value_t = 30)]
     pub server_timeout: u64,
+
+    /// (MCP mode) Maximum seconds to wait for a single test run to finish after the
+    /// Studio plugin has picked it up.
+    #[arg(long, default_value_t = 300)]
+    pub run_timeout: u64,
 
     #[command(flatten, next_help_heading = "runCLI options")]
     pub options: JestOptions,
