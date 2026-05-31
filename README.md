@@ -44,6 +44,10 @@ This keeps the server alive and exposes two tools over stdio:
 
 Roblox Studio still has to be open with the plugin installed; the MCP server just relays runs to it. A `run_tests` call waits up to `--server-timeout` seconds (default 30) for Studio to pick the run up, then up to `--run-timeout` seconds (default 300) for it to finish.
 
+### Multiple agents at once
+
+Several agents can each run their own `jest-companion --mcp` server simultaneously — each one binds the first free port in a small range (`28861`–`28868`), and the Studio plugin polls them all. Because there's a single Studio instance, runs execute one at a time: if a second run is requested while another is still going, it queues and runs as soon as Studio is free. A wedged or leftover MCP server only ties up its own port, so it never blocks the others.
+
 Register it with Claude Code like so:
 
 ```bash

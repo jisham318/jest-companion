@@ -11,7 +11,7 @@ use clap::Parser;
 use fs_err::tokio as fs;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
@@ -22,10 +22,14 @@ mod config;
 mod mcp;
 mod resolver;
 
-/// The one-shot CLI owns this port. The long-running MCP server uses a separate one so the two can
-/// run at the same time; the Studio plugin polls both and serves whichever has a run pending.
+/// The one-shot CLI owns this port.
 const CLI_PORT: u16 = 28860;
-const MCP_PORT: u16 = 28861;
+/// Each `--mcp` server binds the first free port in this range, so several agents can each run
+/// their own MCP server at once. The Studio plugin polls the CLI port plus this range (round-robin)
+/// and serves whichever has a run pending — runs still execute one at a time, since Studio runs
+/// suites serially.
+const MCP_PORT_MIN: u16 = 28861;
+const MCP_PORT_MAX: u16 = 28868;
 
 #[derive(Clone)]
 struct AppState {
@@ -159,37 +163,41 @@ async fn run_mcp(args: Cli) -> anyhow::Result<()> {
     let args = Arc::new(args);
     let config = Arc::new(config);
 
-    // The HTTP server (which the Studio plugin reports to) is best-effort. If the port is already
-    // taken — almost always another jest-companion MCP server that's still running — binding it
-    // must NOT be fatal, or this process would exit before completing the stdio handshake and the
-    // client would just see "failed to connect". Serve the stdio connection regardless; run_tests
-    // reports clearly when this instance doesn't own the port.
-    let http_available = match tokio::net::TcpListener::bind(("127.0.0.1", MCP_PORT)).await {
-        Ok(listener) => {
-            let coord = Arc::new(McpCoord::new(true));
-            let state = AppState {
-                args: args.clone(),
-                config: config.clone(),
-                coord: Coordinator::Mcp(coord.clone()),
-            };
-            tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, router(state)).await {
-                    error!("HTTP server error: {e}");
-                }
-            });
-            return mcp::serve(coord, args, config).await;
+    // The HTTP server (which the Studio plugin reports to) is best-effort. We bind the first free
+    // port in the range so multiple agents can each run their own MCP server; only if EVERY port is
+    // taken do we give up the HTTP side. Binding must never be fatal — otherwise this process would
+    // exit before completing the stdio handshake and the client would just see "failed to connect".
+    // Serve the stdio connection regardless; run_tests reports clearly when it has no port.
+    let mut listener = None;
+    for port in MCP_PORT_MIN..=MCP_PORT_MAX {
+        if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            listener = Some((l, port));
+            break;
         }
-        Err(e) => {
-            warn!(
-                "Could not bind 127.0.0.1:{MCP_PORT} ({e}). Another jest-companion MCP server is \
-                 probably already running; this instance will connect but run_tests will be \
-                 unavailable."
-            );
-            false
-        }
-    };
+    }
 
-    let coord = Arc::new(McpCoord::new(http_available));
+    if let Some((listener, port)) = listener {
+        info!("jest-companion MCP server reachable on 127.0.0.1:{port}");
+        let coord = Arc::new(McpCoord::new(true));
+        let state = AppState {
+            args: args.clone(),
+            config: config.clone(),
+            coord: Coordinator::Mcp(coord.clone()),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router(state)).await {
+                error!("HTTP server error: {e}");
+            }
+        });
+        return mcp::serve(coord, args, config).await;
+    }
+
+    warn!(
+        "All MCP ports ({MCP_PORT_MIN}-{MCP_PORT_MAX}) are in use, so too many jest-companion MCP \
+         servers are already running. This instance will connect but run_tests will be unavailable \
+         until one of them exits."
+    );
+    let coord = Arc::new(McpCoord::new(false));
     // Still serve stdio so the client connects cleanly (run_tests will explain it can't run).
     mcp::serve(coord, args, config).await
 }
@@ -298,6 +306,12 @@ async fn poll(
                 .into_response()
         }
         Coordinator::Mcp(coord) => {
+            // Record that Studio is talking to us, so a queued run_tests doesn't fast-fail with
+            // "Studio isn't open" just because Studio is busy running another agent's suite.
+            coord
+                .ever_polled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+
             let mut active = coord.active.lock().await;
             match active.as_mut() {
                 Some(run) if !run.dispatched => {
@@ -553,5 +567,43 @@ mod tests {
         let app = cli_app();
         let (status, _) = post_poll(&app, "999").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // Multi-agent dispatch: an MCP server stays idle (run:false) until a run_tests call queues a
+    // run, hands it out exactly once, then goes idle again — and any poll marks Studio as seen.
+    #[tokio::test]
+    async fn mcp_poll_idle_then_dispatches_pending_run_once() {
+        let coord = Arc::new(McpCoord::new(true));
+        let state = AppState {
+            args: Arc::new(Cli::parse_from(["jest-companion", "--mcp", "/tmp"])),
+            config: Arc::new(Config::default()),
+            coord: Coordinator::Mcp(coord.clone()),
+        };
+        let app = router(state);
+
+        // Idle: nothing pending -> run:false, and we record that Studio polled us.
+        let (status, body) = post_poll(&app, PROTOCOL_VERSION).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["run"], Value::Bool(false));
+        assert!(coord.ever_polled.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Queue a run, as run_tests would.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        *coord.active.lock().await = Some(mcp::ActiveRun {
+            projects: vec!["Game".to_string()],
+            options: serde_json::json!({}),
+            dispatched: false,
+            output: String::new(),
+            done: Some(tx),
+        });
+
+        // First poll after queuing dispatches it.
+        let (_status, body) = post_poll(&app, PROTOCOL_VERSION).await;
+        assert_eq!(body["run"], Value::Bool(true));
+        assert_eq!(body["projects"][0], "Game");
+
+        // It must only be handed out once; the next poll is idle again.
+        let (_status, body) = post_poll(&app, PROTOCOL_VERSION).await;
+        assert_eq!(body["run"], Value::Bool(false));
     }
 }

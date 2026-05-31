@@ -12,7 +12,11 @@ use crate::{cli::Cli, config::Config};
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::{Mutex, oneshot},
@@ -25,10 +29,15 @@ use tokio::{
 /// `/results` (or `/run-error`) handler signals completion through `done`.
 pub struct McpCoord {
     pub active: Mutex<Option<ActiveRun>>,
-    /// Whether this process managed to bind the HTTP port the Studio plugin reports to. If it
-    /// didn't (another jest-companion MCP server already owns the port), we still serve the stdio
-    /// connection to the client, but `run_tests` can't actually drive a run, so it reports that.
+    /// Whether this process managed to bind an HTTP port for the Studio plugin to report to. If it
+    /// didn't (every port in the range is already taken), we still serve the stdio connection to
+    /// the client, but `run_tests` can't actually drive a run, so it reports that.
     pub http_available: bool,
+    /// Set once the Studio plugin has polled us at least once. Lets `run_tests` tell "Studio isn't
+    /// open" (never polled) apart from "Studio is open but busy running another agent's suite"
+    /// (polled before, just hasn't picked this run up yet) so we don't give up too early while
+    /// queued behind another run.
+    pub ever_polled: AtomicBool,
 }
 
 impl McpCoord {
@@ -36,6 +45,7 @@ impl McpCoord {
         Self {
             active: Mutex::new(None),
             http_available,
+            ever_polled: AtomicBool::new(false),
         }
     }
 }
@@ -423,12 +433,17 @@ async fn run_tests(
         });
     }
 
-    // If Studio never polls, give up after the connect timeout so the tool call doesn't hang.
+    // If Studio never even polls us, give up after the connect timeout so the tool call doesn't
+    // hang. But if Studio HAS polled us before, it's open — it just hasn't picked this run up yet
+    // (likely busy running another agent's suite), so keep waiting up to the full run timeout.
     let watchdog = {
         let coord = coord.clone();
         let connect_timeout = Duration::from_secs(cli.server_timeout);
         tokio::spawn(async move {
             tokio::time::sleep(connect_timeout).await;
+            if coord.ever_polled.load(Ordering::Relaxed) {
+                return;
+            }
             let mut active = coord.active.lock().await;
             if let Some(run) = active.as_mut()
                 && !run.dispatched

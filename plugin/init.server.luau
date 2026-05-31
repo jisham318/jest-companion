@@ -102,15 +102,28 @@ function runTests(body: TestBody): TestResults
 	}
 end
 
--- The CLI and the long-running MCP server listen on different ports so both can run at the same
--- time. We poll each of them and serve whichever one has a run pending.
+-- The one-shot CLI listens on a fixed port; each long-running MCP server (one per agent) binds the
+-- first free port in a range, so several can run at once. We poll the CLI every cycle (a human may
+-- be waiting on it) plus ONE MCP port per cycle, round-robin, and serve whichever has a run
+-- pending. Polling one MCP port at a time keeps us well under Studio's HTTP request budget no
+-- matter how many MCP servers are running; runs still execute one at a time since Studio is serial.
 local CLI_URL = "http://127.0.0.1:28860"
-local MCP_URL = "http://127.0.0.1:28861"
-local SERVER_URLS = { CLI_URL, MCP_URL }
+local MCP_PORT_MIN = 28861
+local MCP_PORT_MAX = 28868
+local mcpCursor = MCP_PORT_MIN
 -- Stashed on Workspace so the patched FileSystemService/Writeable modules (which get cloned into
 -- the Jest tree, away from this script) know which server to report a run's output back to.
 local SERVER_URL_ATTRIBUTE = "__JestCompanion_ServerUrl"
 local PROTOCOL_VERSION = "3"
+
+local function nextMcpUrl(): string
+	local url = `http://127.0.0.1:{mcpCursor}`
+	mcpCursor += 1
+	if mcpCursor > MCP_PORT_MAX then
+		mcpCursor = MCP_PORT_MIN
+	end
+	return url
+end
 
 function poll(url: string): TestBody?
 	local reqSuccess, response = pcall(function()
@@ -206,9 +219,10 @@ function runForServer(url: string, body: TestBody)
 end
 
 function loop()
-	-- Poll each server in turn and serve the first one that has a run pending. The CLI is one-shot
-	-- and time-sensitive, so it goes first; the MCP server stays idle (run == false) between runs.
-	for _, url in SERVER_URLS do
+	-- Poll the CLI (time-sensitive, a human may be waiting) plus one MCP port this cycle, and serve
+	-- the first that has a run pending. Idle servers answer run == false, so we just move on.
+	local urls = { CLI_URL, nextMcpUrl() }
+	for _, url in urls do
 		local success, bodyOrErr = pcall(poll, url)
 		if not success then
 			warn(`Failed to poll server at {url}: {bodyOrErr}`)
