@@ -1,0 +1,52 @@
+# Builds the Roblox plugin (plugin.rbxm) on a version tag and attaches it to the
+# GitHub Release that release.yml (cargo-dist) creates for that same tag.
+#
+# release.yml handles the Rust CLI: cross-platform binaries + hashes. cargo-dist
+# has no knowledge of the Roblox side, so this adds plugin.rbxm to the *same*
+# release. Each version tag then produces one release with both the CLI and the
+# plugin.
+name: Release Plugin
+
+on:
+  push:
+    tags:
+      # Same version-tag pattern release.yml uses, so both run on one tag push.
+      - '**[0-9]+.[0-9]+.[0-9]+*'
+
+# Explicit write so this works even while the repo default token permission is
+# "read".
+permissions:
+  contents: write
+
+jobs:
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installs the toolchain pinned in mise.toml (rojo). All tools here use the
+      # github: backend, so this is a quick prebuilt download, not a build.
+      - uses: jdx/mise-action@v2
+
+      - name: Build Roblox plugin
+        run: mise run build-plugin # -> rojo build -o plugin.rbxm
+
+      # release.yml creates the GitHub Release partway through its own run, after
+      # the platform binaries are built. Wait for the release to exist, then
+      # attach the plugin. --clobber keeps re-runs idempotent.
+      - name: Attach plugin to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          for i in $(seq 1 60); do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" plugin.rbxm --clobber
+              echo "Attached plugin.rbxm to release $TAG"
+              exit 0
+            fi
+            echo "Release $TAG not created yet; waiting 20s ($i/60)"
+            sleep 20
+          done
+          echo "::error::Release $TAG was not created within ~20 minutes"
+          exit 1
