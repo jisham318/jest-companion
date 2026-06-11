@@ -29,10 +29,14 @@ use tokio::{
 /// `/results` (or `/run-error`) handler signals completion through `done`.
 pub struct McpCoord {
     pub active: Mutex<Option<ActiveRun>>,
-    /// Whether this process managed to bind an HTTP port for the Studio plugin to report to. If it
-    /// didn't (every port in the range is already taken), we still serve the stdio connection to
-    /// the client, but `run_tests` can't actually drive a run, so it reports that.
-    pub http_available: bool,
+    /// Serializes `run_tests` calls on this server. Requests are handled concurrently, so two
+    /// agents sharing the connection can call `run_tests` at once; the second queues here (tokio
+    /// mutexes are FIFO) and starts as soon as the first finishes, instead of erroring out.
+    pub run_slot: Mutex<()>,
+    /// Whether this process has an HTTP port the Studio plugin can report to. Starts false when
+    /// every port in the range was taken; the background rebinder in `main.rs` flips it to true
+    /// once another server exits and a port frees up.
+    pub http_available: AtomicBool,
     /// Set once the Studio plugin has polled us at least once. Lets `run_tests` tell "Studio isn't
     /// open" (never polled) apart from "Studio is open but busy running another agent's suite"
     /// (polled before, just hasn't picked this run up yet) so we don't give up too early while
@@ -44,7 +48,8 @@ impl McpCoord {
     pub fn new(http_available: bool) -> Self {
         Self {
             active: Mutex::new(None),
-            http_available,
+            run_slot: Mutex::new(()),
+            http_available: AtomicBool::new(http_available),
             ever_polled: AtomicBool::new(false),
         }
     }
@@ -75,8 +80,43 @@ pub enum Outcome {
 
 /// Run the MCP stdio loop until stdin closes (the client disconnects).
 pub async fn serve(coord: Arc<McpCoord>, cli: Arc<Cli>, config: Arc<Config>) -> anyhow::Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
+    serve_io(tokio::io::stdin(), tokio::io::stdout(), coord, cli, config).await
+}
+
+/// The actual serve loop, generic over the transport so tests can drive it in-memory.
+async fn serve_io<R, W>(
+    reader: R,
+    writer: W,
+    coord: Arc<McpCoord>,
+    cli: Arc<Cli>,
+    config: Arc<Config>,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut lines = BufReader::new(reader).lines();
+
+    // Requests are handled concurrently (below), so responses funnel through a channel to a
+    // single writer task that owns stdout, one line at a time.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    tokio::spawn(async move {
+        let mut stdout = writer;
+        while let Some(response) = rx.recv().await {
+            let mut out = match serde_json::to_string(&response) {
+                Ok(out) => out,
+                Err(e) => {
+                    warn!("Failed to serialize JSON-RPC response: {e}");
+                    continue;
+                }
+            };
+            out.push('\n');
+            if stdout.write_all(out.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = stdout.flush().await;
+        }
+    });
 
     debug!("MCP server ready on stdio");
 
@@ -94,14 +134,23 @@ pub async fn serve(coord: Arc<McpCoord>, cli: Arc<Cli>, config: Arc<Config>) -> 
             }
         };
 
-        if let Some(response) = handle_message(&msg, &coord, &cli, &config).await {
-            let mut out = serde_json::to_string(&response)?;
-            out.push('\n');
-            stdout.write_all(out.as_bytes()).await?;
-            stdout.flush().await?;
-        }
+        // Handle each request on its own task. MCP clients multiplex several agents over one
+        // server process, so a long run_tests must not block pings, tools/list, or another
+        // agent's call — with a sequential loop, one agent's 5-minute run made the server look
+        // dead to everyone else sharing the connection.
+        let coord = coord.clone();
+        let cli = cli.clone();
+        let config = config.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Some(response) = handle_message(&msg, &coord, &cli, &config).await {
+                let _ = tx.send(response);
+            }
+        });
     }
 
+    // Returning tears down the process, including any in-flight requests — the client is gone,
+    // so there is nobody left to answer.
     debug!("stdin closed, shutting down MCP server");
     Ok(())
 }
@@ -376,11 +425,11 @@ async fn run_tests(
     cli: &Arc<Cli>,
     config: &Arc<Config>,
 ) -> anyhow::Result<(String, bool)> {
-    if !coord.http_available {
+    if !coord.http_available.load(Ordering::Relaxed) {
         anyhow::bail!(
-            "This jest-companion MCP server could not bind its port, so it can't reach the Studio \
-             plugin. Another jest-companion MCP server is most likely already running — use that \
-             one, or stop it and restart this server."
+            "This jest-companion MCP server has no HTTP port yet, so it can't reach the Studio \
+             plugin: every port in its range is held by other jest-companion MCP servers. It \
+             keeps retrying in the background, so try again once one of them exits."
         );
     }
 
@@ -418,12 +467,14 @@ async fn run_tests(
         }
     }
 
+    // One run at a time per server: if another agent's run is in flight on this connection,
+    // queue behind it instead of failing the call. Each holder is bounded by run_timeout below,
+    // so the wait is bounded by queue position.
+    let _slot = coord.run_slot.lock().await;
+
     let (tx, rx) = oneshot::channel();
     {
         let mut active = coord.active.lock().await;
-        if active.is_some() {
-            anyhow::bail!("A test run is already in progress; wait for it to finish.");
-        }
         *active = Some(ActiveRun {
             projects,
             options,
@@ -469,7 +520,10 @@ async fn run_tests(
     match outcome {
         Ok(Ok(Outcome::Finished(success))) => Ok((output, success)),
         Ok(Ok(Outcome::NotConnected)) => anyhow::bail!(
-            "Roblox Studio did not pick up the test run within {}s. Make sure Studio is open with a place that has the jest-companion plugin installed.",
+            "Roblox Studio did not pick up the test run within {}s. Make sure Studio is open with \
+             a place that has the jest-companion plugin installed. (If Studio is mid-way through \
+             a long test run for another agent, it can't pick up new runs until that finishes — \
+             try again in a bit.)",
             cli.server_timeout
         ),
         Ok(Ok(Outcome::RunError)) => {
@@ -484,7 +538,8 @@ async fn run_tests(
         // Sender dropped without sending (shouldn't normally happen).
         Ok(Err(_)) => anyhow::bail!("The test run ended unexpectedly."),
         Err(_) => anyhow::bail!(
-            "Timed out after {}s waiting for test results.",
+            "Timed out after {}s waiting for test results. The suite may be hanging, or Studio \
+             may have spent the whole window busy with another agent's run.",
             cli.run_timeout
         ),
     }
@@ -523,6 +578,136 @@ fn strip_ansi(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use std::collections::HashMap;
+
+    fn test_config() -> Arc<Config> {
+        let mut projects = HashMap::new();
+        projects.insert("Game".to_string(), std::path::PathBuf::from("game"));
+        Arc::new(Config { projects })
+    }
+
+    /// Completes runs the way the plugin's HTTP requests would: dispatch whatever is pending,
+    /// then signal it finished.
+    fn spawn_plugin_simulator(coord: Arc<McpCoord>, runs_to_complete: usize) {
+        tokio::spawn(async move {
+            let mut completed = 0;
+            while completed < runs_to_complete {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                coord.ever_polled.store(true, Ordering::Relaxed);
+                let mut active = coord.active.lock().await;
+                if let Some(run) = active.as_mut()
+                    && !run.dispatched
+                {
+                    run.dispatched = true;
+                    run.output.push_str("ok");
+                    if let Some(tx) = run.done.take() {
+                        let _ = tx.send(Outcome::Finished(true));
+                        completed += 1;
+                    }
+                }
+            }
+        });
+    }
+
+    // The fix for one agent locking out the rest: requests used to be handled one at a time, so
+    // a 5-minute run_tests left pings (and every other agent's calls) unanswered and the client
+    // could declare the whole server dead. Now a ping must come back while run_tests is still
+    // in flight.
+    #[tokio::test]
+    async fn ping_is_answered_while_run_tests_is_in_flight() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+
+        let coord = Arc::new(McpCoord::new(true));
+        // Never polled + short server timeout: run_tests resolves on its own after ~1s.
+        let cli = Arc::new(Cli::parse_from([
+            "jest-companion",
+            "--mcp",
+            "--server-timeout",
+            "1",
+            "/tmp",
+        ]));
+        tokio::spawn(serve_io(
+            server_read,
+            server_write,
+            coord,
+            cli,
+            test_config(),
+        ));
+
+        let (client_read, mut client_write) = tokio::io::split(client);
+        client_write
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"run_tests\",\"arguments\":{}}}\n\
+                  {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n",
+            )
+            .await
+            .unwrap();
+
+        let mut lines = BufReader::new(client_read).lines();
+        let first: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            first["id"], 2,
+            "the ping must be answered before the in-flight run_tests finishes"
+        );
+        let second: Value =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(second["id"], 1);
+    }
+
+    // With concurrent handling, two agents can call run_tests at once; the second must queue
+    // behind the first (and then run), not fail with "already in progress".
+    #[tokio::test]
+    async fn concurrent_run_tests_calls_queue_instead_of_failing() {
+        let coord = Arc::new(McpCoord::new(true));
+        coord.ever_polled.store(true, Ordering::Relaxed);
+        let cli = Arc::new(Cli::parse_from(["jest-companion", "--mcp", "/tmp"]));
+        let config = test_config();
+
+        spawn_plugin_simulator(coord.clone(), 2);
+
+        let spawn_run = |coord: Arc<McpCoord>, cli: Arc<Cli>, config: Arc<Config>| {
+            tokio::spawn(async move {
+                run_tests(RunTestsParams::default(), &coord, &cli, &config).await
+            })
+        };
+        let first = spawn_run(coord.clone(), cli.clone(), config.clone());
+        let second = spawn_run(coord, cli, config);
+
+        let (first, second) = tokio::join!(first, second);
+        let (output, success) = first.unwrap().expect("first run should succeed");
+        assert!(success);
+        assert_eq!(output, "ok");
+        let (output, success) = second.unwrap().expect("queued run should succeed, not error");
+        assert!(success);
+        assert_eq!(output, "ok");
+    }
+
+    // A server that started with no port must start working once the background rebinder gets
+    // one, instead of being broken for its whole lifetime.
+    #[tokio::test]
+    async fn run_tests_recovers_once_a_port_frees_up() {
+        let coord = Arc::new(McpCoord::new(false));
+        coord.ever_polled.store(true, Ordering::Relaxed);
+        let cli = Arc::new(Cli::parse_from(["jest-companion", "--mcp", "/tmp"]));
+        let config = test_config();
+
+        let err = run_tests(RunTestsParams::default(), &coord, &cli, &config)
+            .await
+            .expect_err("must fail while there is no port");
+        assert!(err.to_string().contains("no HTTP port"));
+
+        // The background rebinder grabbed a freed port.
+        coord.http_available.store(true, Ordering::Relaxed);
+        spawn_plugin_simulator(coord.clone(), 1);
+
+        let (_, success) = run_tests(RunTestsParams::default(), &coord, &cli, &config)
+            .await
+            .expect("must work after the rebinder got a port");
+        assert!(success);
+    }
 
     #[test]
     fn strips_ansi_color_codes() {

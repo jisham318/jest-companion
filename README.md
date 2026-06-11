@@ -46,7 +46,9 @@ Roblox Studio still has to be open with the plugin installed; the MCP server jus
 
 ### Multiple agents at once
 
-Several agents can each run their own `jest-companion --mcp` server simultaneously — each one binds the first free port in a small range (`28861`–`28868`), and the Studio plugin polls them all. Because there's a single Studio instance, runs execute one at a time: if a second run is requested while another is still going, it queues and runs as soon as Studio is free. A wedged or leftover MCP server only ties up its own port, so it never blocks the others.
+Several agents can each run their own `jest-companion --mcp` server simultaneously — each one binds the first free port in a small range (`28861`–`28868`), and the Studio plugin polls them all. Because there's a single Studio instance, runs execute one at a time: if a second run is requested while another is still going, it queues and runs as soon as Studio is free. That holds within one server too — agents sharing a connection (like Claude Code subagents) can call `run_tests` concurrently and the calls queue rather than fail, and the server keeps answering pings and other tools mid-run.
+
+One agent can't take the MCP down for the rest: a server that starts while every port is taken keeps retrying in the background and starts working as soon as one frees up, a wedged or leftover server only ties up its own port, and the plugin abandons a test run that hasn't finished within the server's `--run-timeout` (reporting it as a run error) instead of letting a hanging suite block all future runs until Studio restarts.
 
 Register it with Claude Code like so:
 

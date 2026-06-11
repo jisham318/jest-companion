@@ -75,6 +75,9 @@ type TestBody = {
 	-- When false, the server has nothing for us to run right now (used by the MCP server, which
 	-- keeps the server alive between runs). Absent or true means run as normal.
 	run: boolean?,
+	-- How many seconds to let the run go before abandoning it (mirrors the server's
+	-- --run-timeout). Absent on older servers; we fall back to a default.
+	runTimeout: number?,
 }
 
 type TestResults = {
@@ -191,30 +194,52 @@ function reportError(url: string)
 	return nil
 end
 
+-- Used when the server didn't send a runTimeout (an older server). Matches the server's
+-- --run-timeout default.
+local DEFAULT_RUN_TIMEOUT_SECONDS = 300
+
 function runForServer(url: string, body: TestBody)
 	-- Tell the patched filesystem/write modules which server to report this run's output back to.
 	Workspace:SetAttribute(SERVER_URL_ATTRIBUTE, url)
 
-	local output: TestResults
-	do
+	-- Run the suite on its own thread and watch it from here. A suite that never finishes (an
+	-- unresolved promise, a stuck async test) used to block this loop forever, which killed test
+	-- running for EVERY server until the place was reopened — so after the run timeout we abandon
+	-- the run, tell its server, and get back to polling.
+	local finished = false
+	local runThread = task.spawn(function()
 		local success, outputOrErr = pcall(runTests, body)
-		if not success then
+		if success then
+			local sendSuccess, sendErr = pcall(sendResults, url, outputOrErr)
+			if not sendSuccess then
+				warn(`Failed to send output: {sendErr}`)
+			end
+		else
 			warn(`Test run error: {outputOrErr}`)
 
 			local reportSuccess, reportErr = pcall(reportError, url)
 			if not reportSuccess then
 				warn(`Failed to report error: {reportErr}`)
 			end
-
-			return
 		end
+		finished = true
+	end)
 
-		output = outputOrErr
+	local timeout = body.runTimeout or DEFAULT_RUN_TIMEOUT_SECONDS
+	local deadline = os.clock() + timeout
+	while not finished and os.clock() < deadline do
+		task.wait(0.5)
 	end
 
-	local success, err = pcall(sendResults, url, output)
-	if not success then
-		warn(`Failed to send output: {err}`)
+	if not finished then
+		-- Cancellation only lands if the run is parked at a yield point; a busy-loop freezes
+		-- Studio outright and nothing can save that.
+		pcall(task.cancel, runThread)
+		warn(`Test run didn't finish within {timeout}s; abandoning it so other runs can proceed.`)
+		local reportSuccess, reportErr = pcall(reportError, url)
+		if not reportSuccess then
+			warn(`Failed to report error: {reportErr}`)
+		end
 	end
 end
 

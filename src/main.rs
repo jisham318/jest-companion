@@ -165,41 +165,65 @@ async fn run_mcp(args: Cli) -> anyhow::Result<()> {
 
     // The HTTP server (which the Studio plugin reports to) is best-effort. We bind the first free
     // port in the range so multiple agents can each run their own MCP server; only if EVERY port is
-    // taken do we give up the HTTP side. Binding must never be fatal — otherwise this process would
-    // exit before completing the stdio handshake and the client would just see "failed to connect".
-    // Serve the stdio connection regardless; run_tests reports clearly when it has no port.
-    let mut listener = None;
-    for port in MCP_PORT_MIN..=MCP_PORT_MAX {
-        if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-            listener = Some((l, port));
-            break;
+    // taken do we give up the HTTP side for now. Binding must never be fatal — otherwise this
+    // process would exit before completing the stdio handshake and the client would just see
+    // "failed to connect". Serve the stdio connection regardless; run_tests reports clearly while
+    // it has no port.
+    let listener = bind_first_free_mcp_port().await;
+
+    let coord = Arc::new(McpCoord::new(listener.is_some()));
+    let state = AppState {
+        args: args.clone(),
+        config: config.clone(),
+        coord: Coordinator::Mcp(coord.clone()),
+    };
+
+    match listener {
+        Some((listener, port)) => {
+            info!("jest-companion MCP server reachable on 127.0.0.1:{port}");
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, router(state)).await {
+                    error!("HTTP server error: {e}");
+                }
+            });
+        }
+        None => {
+            warn!(
+                "All MCP ports ({MCP_PORT_MIN}-{MCP_PORT_MAX}) are in use, so too many \
+                 jest-companion MCP servers are already running. This instance will connect, and \
+                 run_tests will become available as soon as one of them exits."
+            );
+            // Keep retrying in the background so this server heals once a port frees up, rather
+            // than staying broken for its whole lifetime while ports sit idle.
+            let coord = coord.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if let Some((listener, port)) = bind_first_free_mcp_port().await {
+                        coord
+                            .http_available
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        info!("jest-companion MCP server now reachable on 127.0.0.1:{port}");
+                        if let Err(e) = axum::serve(listener, router(state)).await {
+                            error!("HTTP server error: {e}");
+                        }
+                        return;
+                    }
+                }
+            });
         }
     }
 
-    if let Some((listener, port)) = listener {
-        info!("jest-companion MCP server reachable on 127.0.0.1:{port}");
-        let coord = Arc::new(McpCoord::new(true));
-        let state = AppState {
-            args: args.clone(),
-            config: config.clone(),
-            coord: Coordinator::Mcp(coord.clone()),
-        };
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, router(state)).await {
-                error!("HTTP server error: {e}");
-            }
-        });
-        return mcp::serve(coord, args, config).await;
-    }
-
-    warn!(
-        "All MCP ports ({MCP_PORT_MIN}-{MCP_PORT_MAX}) are in use, so too many jest-companion MCP \
-         servers are already running. This instance will connect but run_tests will be unavailable \
-         until one of them exits."
-    );
-    let coord = Arc::new(McpCoord::new(false));
-    // Still serve stdio so the client connects cleanly (run_tests will explain it can't run).
     mcp::serve(coord, args, config).await
+}
+
+async fn bind_first_free_mcp_port() -> Option<(tokio::net::TcpListener, u16)> {
+    for port in MCP_PORT_MIN..=MCP_PORT_MAX {
+        if let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+            return Some((listener, port));
+        }
+    }
+    None
 }
 
 fn router(state: AppState) -> Router {
@@ -234,6 +258,10 @@ struct PollResponseBody {
     /// MCP mode it's only true when a `run_tests` call is waiting, so the plugin can poll quietly
     /// the rest of the time.
     run: bool,
+    /// How many seconds the plugin should let the run go before abandoning it and reporting a run
+    /// error (mirrors this server's --run-timeout). Without this, a hanging suite wedged the
+    /// plugin's poll loop forever, blocking every other server until the place was reopened.
+    run_timeout: u64,
 }
 
 async fn poll(
@@ -279,6 +307,7 @@ async fn poll(
                         projects: Vec::new(),
                         options: Value::Object(Default::default()),
                         run: false,
+                        run_timeout: state.args.run_timeout,
                     }),
                 )
                     .into_response();
@@ -301,6 +330,7 @@ async fn poll(
                     projects,
                     options,
                     run: true,
+                    run_timeout: state.args.run_timeout,
                 }),
             )
                 .into_response()
@@ -327,6 +357,7 @@ async fn poll(
                             projects: run.projects.clone(),
                             options: run.options.clone(),
                             run: true,
+                            run_timeout: state.args.run_timeout,
                         }),
                     )
                         .into_response()
@@ -338,6 +369,7 @@ async fn poll(
                         projects: Vec::new(),
                         options: Value::Object(Default::default()),
                         run: false,
+                        run_timeout: state.args.run_timeout,
                     }),
                 )
                     .into_response(),
@@ -359,7 +391,12 @@ async fn write(State(state): State<AppState>, data: String) -> impl IntoResponse
         }
         Coordinator::Mcp(coord) => {
             let mut active = coord.active.lock().await;
-            if let Some(run) = active.as_mut() {
+            // Only a dispatched run can legitimately receive output. An undispatched run getting
+            // writes means they're strays from a previous run the plugin is still (briefly)
+            // unwinding after that run's tool call timed out — don't let them pollute this one.
+            if let Some(run) = active.as_mut()
+                && run.dispatched
+            {
                 run.output.push_str(&data);
             }
         }
@@ -389,7 +426,10 @@ async fn results(State(state): State<AppState>, Json(results): Json<Results>) ->
                 // before we declare the run done (mirrors the CLI's pre-exit grace period).
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 let mut active = coord.active.lock().await;
+                // `dispatched` guards against a stray result from a previous, abandoned run
+                // completing a queued run that the plugin hasn't even picked up yet.
                 if let Some(run) = active.as_mut()
+                    && run.dispatched
                     && let Some(tx) = run.done.take()
                 {
                     let _ = tx.send(mcp::Outcome::Finished(results.success));
@@ -419,7 +459,10 @@ async fn run_error(State(state): State<AppState>) -> impl IntoResponse {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 let mut active = coord.active.lock().await;
+                // Same `dispatched` guard as /results: don't let a stray error from an abandoned
+                // run fail a queued run the plugin hasn't picked up.
                 if let Some(run) = active.as_mut()
+                    && run.dispatched
                     && let Some(tx) = run.done.take()
                 {
                     let _ = tx.send(mcp::Outcome::RunError);
@@ -597,10 +640,11 @@ mod tests {
             done: Some(tx),
         });
 
-        // First poll after queuing dispatches it.
+        // First poll after queuing dispatches it, telling the plugin how long to let it run.
         let (_status, body) = post_poll(&app, PROTOCOL_VERSION).await;
         assert_eq!(body["run"], Value::Bool(true));
         assert_eq!(body["projects"][0], "Game");
+        assert_eq!(body["runTimeout"], 300, "the --run-timeout default");
 
         // It must only be handed out once; the next poll is idle again.
         let (_status, body) = post_poll(&app, PROTOCOL_VERSION).await;
